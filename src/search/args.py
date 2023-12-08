@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from copy import copy
 
-sys.path.insert(0, '/kaggle/working/OurDARTS')
+sys.path.insert(0, '/kaggle/working/OurDarts')
 from src import utils
 
 class Parser(object):
@@ -57,7 +57,7 @@ class Parser(object):
         parser.add_argument('--drop_path_prob',          type=float,          default=0.2,            help='drop path probability')
 
         # logging options
-        parser.add_argument('--save',                    type=str,            default='/kaggle/working/OurDARTS/experiments/search_logs',  help='experiment name')
+        parser.add_argument('--save',                    type=str,            default='/kaggle/working/OurDarts/experiments/search_logs',  help='experiment name')
         parser.add_argument('--results_file_arch',       type=str,            default='/kaggle/working/results_arch', help='filename where to write architectures')
         parser.add_argument('--results_file_perf',       type=str,            default='/kaggle/working/results_perf', help='filename where to write val errors')
         parser.add_argument('--report_freq',             type=float,          default=50,             help='report frequency')
