@@ -27,7 +27,7 @@ for d in $datasets; do
 	for s in $spaces; do
 		for dp in $dpath; do
 			for wd in $wdecay; do
-				/kaggle/working/RobustDARTS/scripts/DARTS_search.sh $s $d $dp $wd &
+				/kaggle/working/OurDARTS/scripts/DARTS_search.sh $s $d $dp $wd &
 				echo submitted job $s $d $dp $wd
 			done
 		done
