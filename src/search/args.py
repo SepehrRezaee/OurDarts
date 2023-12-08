@@ -18,7 +18,7 @@ from src import utils
 
 class Parser(object):
     def __init__(self):
-        parser = argparse.ArgumentParser("OurDARTS")
+        parser = argparse.ArgumentParser("OurDarts")
 
         # general options
         parser.add_argument('--data', type=str, default='/kaggle/input/novelmindscientistsdataset/MRI')
