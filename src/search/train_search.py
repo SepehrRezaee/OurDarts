@@ -18,7 +18,7 @@ from numpy import linalg as LA
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-sys.path.insert(0, '/kaggle/working/OurDarts')
+sys.path.insert(0, '/kaggle/input/ourdarts/OurDarts-main')
 
 from src import utils
 from src.spaces import spaces_dict
