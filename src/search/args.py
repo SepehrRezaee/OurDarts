@@ -13,12 +13,12 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from copy import copy
 
-sys.path.insert(0, '/kaggle/working/OurDarts')
+sys.path.insert(0, '/kaggle/input/ourdarts/OurDarts-main/')
 from src import utils
 
 class Parser(object):
     def __init__(self):
-        parser = argparse.ArgumentParser("OurDarts")
+        parser = argparse.ArgumentParser("OurDarts-main")
 
         # general options
         parser.add_argument('--data', type=str, default='/kaggle/input/novelmindscientistsdataset/MRI')
