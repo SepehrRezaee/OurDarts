@@ -42,427 +42,425 @@ schedule_of_params = []
 
 
 def main(primitives):
-  if not torch.cuda.is_available():
-    logging.info('no gpu device available')
-    sys.exit(1)
+    if not torch.cuda.is_available():
+        logging.info('no gpu device available')
+        sys.exit(1)
 
-  np.random.seed(2)
-  torch.cuda.set_device(args.gpu)
-  cudnn.benchmark = True
-  torch.manual_seed(2)
-  cudnn.enabled=True
-  torch.cuda.manual_seed(2)
-  logging.info('gpu device = %d' % args.gpu)
+    np.random.seed(2)
+    torch.manual_seed(2)
+    torch.cuda.manual_seed(2)
 
-  criterion = nn.CrossEntropyLoss()
-  criterion = criterion.cuda()
+    # specify the GPU ids you want to use, GPU ids start from 0.
+    device_ids = [0, 1]  # replace with your GPU ids
+    device = torch.device(f'cuda:{device_ids[0]}' if torch.cuda.is_available() else 'cpu')
 
-  model_init = Network(args.init_channels, args.n_classes, args.layers, criterion,
-                       primitives, steps=args.nodes)
-  model_init = model_init.cuda()
-  logging.info("param size = %fMB", utils.count_parameters_in_MB(model_init))
+    cudnn.benchmark = True
+    cudnn.enabled = True
 
-  optimizer_init = torch.optim.SGD(
-      model_init.parameters(),
-      args.learning_rate,
-      momentum=args.momentum,
-      weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.cuda()
 
-  architect_init = Architect(model_init, args)
+    model_init = Network(args.init_channels, args.n_classes, args.layers, criterion,
+                         primitives, steps=args.nodes)
+    model_init = nn.DataParallel(model_init, device_ids=device_ids)  # wrap your model in nn.DataParallel module
+    model_init = model_init.to(device)
 
-  scheduler_init = CosineAnnealingLR(
+    logging.info("param size = %fMB", utils.count_parameters_in_MB(model_init))
+
+    optimizer_init = torch.optim.SGD(
+        model_init.parameters(),
+        args.learning_rate,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay)
+
+    architect_init = Architect(model_init, args)
+
+    scheduler_init = CosineAnnealingLR(
         optimizer_init, float(args.epochs), eta_min=args.learning_rate_min)
 
-  analyser_init = Analyzer(args, model_init)
-  la_tracker = utils.EVLocalAvg(args.window, args.report_freq_hessian,
-                                args.epochs)
+    analyser_init = Analyzer(args, model_init)
+    la_tracker = utils.EVLocalAvg(args.window, args.report_freq_hessian,
+                                  args.epochs)
 
-  train_queue, valid_queue, train_transform, valid_transform = helper.get_train_val_loaders()
+    train_queue, valid_queue, train_transform, valid_transform = helper.get_train_val_loaders()
 
+    errors_dict = {'train_acc': [], 'train_loss': [], 'valid_acc': [],
+                   'valid_loss': []}
 
-  errors_dict = {'train_acc': [], 'train_loss': [], 'valid_acc': [],
-                 'valid_loss': []}
+    # for epoch in range(args.epochs):
+    def train_epochs(epochs_to_train, iteration,
+                     args=args, model=model_init, optimizer=optimizer_init,
+                     scheduler=scheduler_init,
+                     train_queue=train_queue, valid_queue=valid_queue,
+                     train_transform=train_transform,
+                     valid_transform=valid_transform,
+                     architect=architect_init, criterion=criterion,
+                     primitives=primitives, analyser=analyser_init,
+                     la_tracker=la_tracker,
+                     errors_dict=errors_dict, start_epoch=-1):
 
-  #for epoch in range(args.epochs):
-  def train_epochs(epochs_to_train, iteration,
-                   args=args, model=model_init, optimizer=optimizer_init,
-                   scheduler=scheduler_init,
-                   train_queue=train_queue, valid_queue=valid_queue,
-                   train_transform=train_transform,
-                   valid_transform=valid_transform,
-                   architect=architect_init, criterion=criterion,
-                   primitives=primitives, analyser=analyser_init,
-                   la_tracker=la_tracker,
-                   errors_dict=errors_dict, start_epoch=-1):
+        logging.info('STARTING ITERATION: %d', iteration)
+        logging.info('EPOCHS TO TRAIN: %d', epochs_to_train - start_epoch - 1)
 
-    logging.info('STARTING ITERATION: %d', iteration)
-    logging.info('EPOCHS TO TRAIN: %d', epochs_to_train - start_epoch - 1)
+        la_tracker.stop_search = False
 
-    la_tracker.stop_search = False
+        if epochs_to_train - start_epoch - 1 <= 0:
+            return model.genotype(), -1
+        for epoch in range(start_epoch + 1, epochs_to_train):
+            # set the epoch to the right one
+            # epoch += args.epochs - epochs_to_train
 
-    if epochs_to_train - start_epoch - 1 <= 0:
-        return model.genotype(), -1
-    for epoch in range(start_epoch+1, epochs_to_train):
-      # set the epoch to the right one
-      #epoch += args.epochs - epochs_to_train
+            scheduler.step(epoch)
+            lr = scheduler.get_lr()[0]
+            if args.drop_path_prob != 0:
+                model.drop_path_prob = args.drop_path_prob * epoch / (args.epochs - 1)
+                train_transform.transforms[-1].cutout_prob = args.cutout_prob * epoch / (args.epochs - 1)
+                logging.info('epoch %d lr %e drop_prob %e cutout_prob %e', epoch, lr,
+                             model.drop_path_prob,
+                             train_transform.transforms[-1].cutout_prob)
+            else:
+                logging.info('epoch %d lr %e', epoch, lr)
 
-      scheduler.step(epoch)
-      lr = scheduler.get_lr()[0]
-      if args.drop_path_prob != 0:
-        model.drop_path_prob = args.drop_path_prob * epoch / (args.epochs - 1)
-        train_transform.transforms[-1].cutout_prob = args.cutout_prob * epoch / (args.epochs - 1)
-        logging.info('epoch %d lr %e drop_prob %e cutout_prob %e', epoch, lr,
-                      model.drop_path_prob,
-                      train_transform.transforms[-1].cutout_prob)
-      else:
-        logging.info('epoch %d lr %e', epoch, lr)
+            # training
+            train_acc, train_obj = train(epoch, primitives, train_queue,
+                                         valid_queue, model, architect, criterion,
+                                         optimizer, lr, analyser, la_tracker,
+                                         iteration)
+            logging.info('train_acc %f', train_acc)
 
-      # training
-      train_acc, train_obj = train(epoch, primitives, train_queue,
-                                   valid_queue, model, architect, criterion,
-                                   optimizer, lr, analyser, la_tracker,
-                                   iteration)
-      logging.info('train_acc %f', train_acc)
+            # validation
+            valid_acc, valid_obj = infer(valid_queue, model, criterion)
+            logging.info('valid_acc %f', valid_acc)
 
-      # validation
-      valid_acc, valid_obj = infer(valid_queue, model, criterion)
-      logging.info('valid_acc %f', valid_acc)
+            # update the errors dictionary
+            errors_dict['train_acc'].append(100 - train_acc)
+            errors_dict['train_loss'].append(train_obj)
+            errors_dict['valid_acc'].append(100 - valid_acc)
+            errors_dict['valid_loss'].append(valid_obj)
 
-      # update the errors dictionary
-      errors_dict['train_acc'].append(100 - train_acc)
-      errors_dict['train_loss'].append(train_obj)
-      errors_dict['valid_acc'].append(100 - valid_acc)
-      errors_dict['valid_loss'].append(valid_obj)
+            genotype = model.genotype()
 
-      genotype = model.genotype()
+            logging.info('genotype = %s', genotype)
 
-      logging.info('genotype = %s', genotype)
+            print(F.softmax(model.alphas_normal, dim=-1))
+            print(F.softmax(model.alphas_reduce, dim=-1))
 
-      print(F.softmax(model.alphas_normal, dim=-1))
-      print(F.softmax(model.alphas_reduce, dim=-1))
+            state = {'state_dict': model.state_dict(),
+                     'optimizer': optimizer.state_dict(),
+                     'alphas_normal': model.alphas_normal.data,
+                     'alphas_reduce': model.alphas_reduce.data,
+                     'arch_optimizer': architect.optimizer.state_dict(),
+                     'lr': lr,
+                     'ev': la_tracker.ev,
+                     'ev_local_avg': la_tracker.ev_local_avg,
+                     'genotypes': la_tracker.genotypes,
+                     'la_epochs': la_tracker.la_epochs,
+                     'la_start_idx': la_tracker.la_start_idx,
+                     'la_end_idx': la_tracker.la_end_idx,
+                     # 'scheduler': scheduler.state_dict(),
+                     }
 
-      state = {'state_dict': model.state_dict(),
-               'optimizer': optimizer.state_dict(),
-               'alphas_normal': model.alphas_normal.data,
-               'alphas_reduce': model.alphas_reduce.data,
-               'arch_optimizer': architect.optimizer.state_dict(),
-               'lr': lr,
-               'ev': la_tracker.ev,
-               'ev_local_avg': la_tracker.ev_local_avg,
-               'genotypes': la_tracker.genotypes,
-               'la_epochs': la_tracker.la_epochs,
-               'la_start_idx': la_tracker.la_start_idx,
-               'la_end_idx': la_tracker.la_end_idx,
-               #'scheduler': scheduler.state_dict(),
-              }
+            utils.save_checkpoint(state, False, args.save, epoch, 1)
 
-      utils.save_checkpoint(state, False, args.save, epoch, 1)
+            if not args.compute_hessian:
+                ev = -1
+            else:
+                ev = la_tracker.ev[-1]
+            params = {'iteration': iteration,
+                      'epoch': epoch,
+                      'wd': args.weight_decay,
+                      'ev': ev,
+                      }
 
-      if not args.compute_hessian:
-        ev = -1
-      else:
-        ev = la_tracker.ev[-1]
-      params = {'iteration': iteration,
-                'epoch': epoch,
-                'wd': args.weight_decay,
-                'ev': ev,
-               }
+            schedule_of_params.append(params)
 
-      schedule_of_params.append(params)
+            # limit the number of iterations based on the maximum regularization
+            # value predefined by the user
+            final_iteration = round(
+                np.log(args.max_weight_decay) / np.log(args.weight_decay), 1) == 1.
 
-      # limit the number of iterations based on the maximum regularization
-      # value predefined by the user
-      final_iteration = round(
-          np.log(args.max_weight_decay) / np.log(args.weight_decay), 1) == 1.
+            if la_tracker.stop_search and not final_iteration:
+                if args.early_stop == 1:
+                    # set the following to the values they had at stop_epoch
+                    errors_dict['valid_acc'] = errors_dict['valid_acc'][:la_tracker.stop_epoch + 1]
+                    genotype = la_tracker.stop_genotype
+                    valid_acc = 100 - errors_dict['valid_acc'][la_tracker.stop_epoch]
+                    logging.info(
+                        'Decided to stop the search at epoch %d (Current epoch: %d)',
+                        la_tracker.stop_epoch, epoch
+                    )
+                    logging.info(
+                        'Validation accuracy at stop epoch: %f', valid_acc
+                    )
+                    logging.info(
+                        'Genotype at stop epoch: %s', genotype
+                    )
+                    break
 
-      if la_tracker.stop_search and not final_iteration:
-        if args.early_stop == 1:
-          # set the following to the values they had at stop_epoch
-          errors_dict['valid_acc'] = errors_dict['valid_acc'][:la_tracker.stop_epoch + 1]
-          genotype = la_tracker.stop_genotype
-          valid_acc = 100 - errors_dict['valid_acc'][la_tracker.stop_epoch]
-          logging.info(
-              'Decided to stop the search at epoch %d (Current epoch: %d)',
-              la_tracker.stop_epoch, epoch
-          )
-          logging.info(
-              'Validation accuracy at stop epoch: %f', valid_acc
-          )
-          logging.info(
-              'Genotype at stop epoch: %s', genotype
-          )
-          break
+                elif args.early_stop == 2:
+                    # simulate early stopping and continue search afterwards
+                    simulated_errors_dict = errors_dict['valid_acc'][:la_tracker.stop_epoch + 1]
+                    simulated_genotype = la_tracker.stop_genotype
+                    simulated_valid_acc = 100 - simulated_errors_dict[la_tracker.stop_epoch]
+                    logging.info(
+                        '(SIM) Decided to stop the search at epoch %d (Current epoch: %d)',
+                        la_tracker.stop_epoch, epoch
+                    )
+                    logging.info(
+                        '(SIM) Validation accuracy at stop epoch: %f', simulated_valid_acc
+                    )
+                    logging.info(
+                        '(SIM) Genotype at stop epoch: %s', simulated_genotype
+                    )
 
-        elif args.early_stop == 2:
-          # simulate early stopping and continue search afterwards
-          simulated_errors_dict = errors_dict['valid_acc'][:la_tracker.stop_epoch + 1]
-          simulated_genotype = la_tracker.stop_genotype
-          simulated_valid_acc = 100 - simulated_errors_dict[la_tracker.stop_epoch]
-          logging.info(
-              '(SIM) Decided to stop the search at epoch %d (Current epoch: %d)',
-              la_tracker.stop_epoch, epoch
-          )
-          logging.info(
-              '(SIM) Validation accuracy at stop epoch: %f', simulated_valid_acc
-          )
-          logging.info(
-              '(SIM) Genotype at stop epoch: %s', simulated_genotype
-          )
+                    with open(os.path.join(args.save,
+                                           'arch_early_{}'.format(1)),
+                              'w') as file:
+                        file.write(str(simulated_genotype))
 
-          with open(os.path.join(args.save,
-                                 'arch_early_{}'.format(1)),
-                    'w') as file:
-            file.write(str(simulated_genotype))
+                    utils.write_yaml_results(args, 'early_' + args.results_file_arch,
+                                             str(simulated_genotype))
+                    utils.write_yaml_results(args, 'early_stop_epochs',
+                                             la_tracker.stop_epoch)
 
-          utils.write_yaml_results(args, 'early_'+args.results_file_arch,
-                                   str(simulated_genotype))
-          utils.write_yaml_results(args, 'early_stop_epochs',
-                                   la_tracker.stop_epoch)
+                    args.early_stop = 0
 
-          args.early_stop = 0
+                elif args.early_stop == 3:
+                    # adjust regularization
+                    simulated_errors_dict = errors_dict['valid_acc'][:la_tracker.stop_epoch + 1]
+                    simulated_genotype = la_tracker.stop_genotype
+                    simulated_valid_acc = 100 - simulated_errors_dict[la_tracker.stop_epoch]
+                    stop_epoch = la_tracker.stop_epoch
+                    start_again_epoch = stop_epoch - args.extra_rollback_epochs
+                    logging.info(
+                        '(ADA) Decided to increase regularization at epoch %d (Current epoch: %d)',
+                        stop_epoch, epoch
+                    )
+                    logging.info(
+                        '(ADA) Rolling back to epoch %d', start_again_epoch
+                    )
+                    logging.info(
+                        '(ADA) Restoring model parameters and continuing for %d epochs',
+                        epochs_to_train - start_again_epoch - 1
+                    )
 
-        elif args.early_stop == 3:
-          # adjust regularization
-          simulated_errors_dict = errors_dict['valid_acc'][:la_tracker.stop_epoch + 1]
-          simulated_genotype = la_tracker.stop_genotype
-          simulated_valid_acc = 100 - simulated_errors_dict[la_tracker.stop_epoch]
-          stop_epoch = la_tracker.stop_epoch
-          start_again_epoch = stop_epoch - args.extra_rollback_epochs
-          logging.info(
-              '(ADA) Decided to increase regularization at epoch %d (Current epoch: %d)',
-              stop_epoch, epoch
-          )
-          logging.info(
-              '(ADA) Rolling back to epoch %d', start_again_epoch
-          )
-          logging.info(
-              '(ADA) Restoring model parameters and continuing for %d epochs',
-              epochs_to_train - start_again_epoch - 1
-          )
+                    if iteration == 1:
+                        logging.info(
+                            '(ADA) Saving the architecture at the early stop epoch and '
+                            'continuing with the adaptive regularization strategy'
+                        )
+                        utils.write_yaml_results(args, 'early_' + args.results_file_arch,
+                                                 str(simulated_genotype))
 
-          if iteration == 1:
-              logging.info(
-                  '(ADA) Saving the architecture at the early stop epoch and '
-                  'continuing with the adaptive regularization strategy'
-              )
-              utils.write_yaml_results(args, 'early_'+args.results_file_arch,
-                                       str(simulated_genotype))
+                    del model
+                    del architect
+                    del optimizer
+                    del scheduler
+                    del analyser
 
-          del model
-          del architect
-          del optimizer
-          del scheduler
-          del analyser
+                    model_new = Network(args.init_channels, args.n_classes, args.layers, criterion,
+                                        primitives, steps=args.nodes)
+                    model_new = model_new.cuda()
 
-          model_new = Network(args.init_channels, args.n_classes, args.layers, criterion,
-                          primitives, steps=args.nodes)
-          model_new = model_new.cuda()
+                    optimizer_new = torch.optim.SGD(
+                        model_new.parameters(),
+                        args.learning_rate,
+                        momentum=args.momentum,
+                        weight_decay=args.weight_decay)
 
-          optimizer_new = torch.optim.SGD(
-              model_new.parameters(),
-              args.learning_rate,
-              momentum=args.momentum,
-              weight_decay=args.weight_decay)
+                    architect_new = Architect(model_new, args)
 
-          architect_new = Architect(model_new, args)
+                    analyser_new = Analyzer(args, model_new)
 
-          analyser_new = Analyzer(args, model_new)
+                    la_tracker = utils.EVLocalAvg(args.window, args.report_freq_hessian,
+                                                  args.epochs)
 
-          la_tracker = utils.EVLocalAvg(args.window, args.report_freq_hessian,
-                                        args.epochs)
+                    lr = utils.load_checkpoint(model_new, optimizer_new, None,
+                                               architect_new, args.save, la_tracker,
+                                               start_again_epoch, 1)
 
-          lr = utils.load_checkpoint(model_new, optimizer_new, None,
-                                     architect_new, args.save, la_tracker,
-                                     start_again_epoch, 1)
+                    args.weight_decay *= args.mul_factor
+                    for param_group in optimizer_new.param_groups:
+                        param_group['weight_decay'] = args.weight_decay
 
-          args.weight_decay *= args.mul_factor
-          for param_group in optimizer_new.param_groups:
-              param_group['weight_decay'] = args.weight_decay
+                    scheduler_new = CosineAnnealingLR(
+                        optimizer_new, float(args.epochs),
+                        eta_min=args.learning_rate_min)
 
-          scheduler_new = CosineAnnealingLR(
-              optimizer_new, float(args.epochs),
-              eta_min=args.learning_rate_min)
+                    logging.info(
+                        '(ADA) Validation accuracy at stop epoch: %f', simulated_valid_acc
+                    )
+                    logging.info(
+                        '(ADA) Genotype at stop epoch: %s', simulated_genotype
+                    )
 
+                    logging.info(
+                        '(ADA) Adjusting L2 regularization to the new value: %f',
+                        args.weight_decay
+                    )
 
-          logging.info(
-              '(ADA) Validation accuracy at stop epoch: %f', simulated_valid_acc
-          )
-          logging.info(
-              '(ADA) Genotype at stop epoch: %s', simulated_genotype
-          )
+                    genotype, valid_acc = train_epochs(args.epochs,
+                                                       iteration + 1, model=model_new,
+                                                       optimizer=optimizer_new,
+                                                       architect=architect_new,
+                                                       scheduler=scheduler_new,
+                                                       analyser=analyser_new,
+                                                       start_epoch=start_again_epoch)
+                    args.early_stop = 0
+                    break
 
-          logging.info(
-              '(ADA) Adjusting L2 regularization to the new value: %f',
-              args.weight_decay
-          )
+        return genotype, valid_acc
 
-          genotype, valid_acc = train_epochs(args.epochs,
-                                             iteration + 1, model=model_new,
-                                             optimizer=optimizer_new,
-                                             architect=architect_new,
-                                             scheduler=scheduler_new,
-                                             analyser=analyser_new,
-                                             start_epoch=start_again_epoch)
-          args.early_stop = 0
-          break
+    # call train_epochs recursively
+    genotype, valid_acc = train_epochs(args.epochs, 1)
 
-    return genotype, valid_acc
+    with codecs.open(os.path.join(args.save,
+                                  'errors_{}.json'.format(1)),
+                     'w', encoding='utf-8') as file:
+        json.dump(errors_dict, file, separators=(',', ':'))
 
-  # call train_epochs recursively
-  genotype, valid_acc = train_epochs(args.epochs, 1)
+    with open(os.path.join(args.save,
+                           'arch_{}'.format(1)),
+              'w') as file:
+        file.write(str(genotype))
 
-  with codecs.open(os.path.join(args.save,
-                                'errors_{}.json'.format(1)),
-                   'w', encoding='utf-8') as file:
-    json.dump(errors_dict, file, separators=(',', ':'))
+    utils.write_yaml_results(args, args.results_file_arch, str(genotype))
+    utils.write_yaml_results(args, args.results_file_perf, 100 - valid_acc)
 
-  with open(os.path.join(args.save,
-                         'arch_{}'.format(1)),
-            'w') as file:
-    file.write(str(genotype))
-
-  utils.write_yaml_results(args, args.results_file_arch, str(genotype))
-  utils.write_yaml_results(args, args.results_file_perf, 100-valid_acc)
-
-  with open(os.path.join(args.save,
-                         'schedule_{}.pickle'.format(1)),
-            'ab') as file:
-    pickle.dump(schedule_of_params, file, pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(args.save,
+                           'schedule_{}.pickle'.format(1)),
+              'ab') as file:
+        pickle.dump(schedule_of_params, file, pickle.HIGHEST_PROTOCOL)
 
 
 def train(epoch, primitives, train_queue, valid_queue, model, architect,
           criterion, optimizer, lr, analyser, local_avg_tracker, iteration=1):
-  objs = utils.AvgrageMeter()
-  top1 = utils.AvgrageMeter()
-  top5 = utils.AvgrageMeter()
+    objs = utils.AvgrageMeter()
+    top1 = utils.AvgrageMeter()
+    top5 = utils.AvgrageMeter()
 
-  for step, (input, target) in enumerate(train_queue):
-    model.train()
-    n = input.size(0)
+    for step, (input, target) in enumerate(train_queue):
+        model.train()
+        n = input.size(0)
 
-    input = Variable(input, requires_grad=False).cuda()
-#     target = Variable(target, requires_grad=False).cuda(async=True)
-    target = Variable(target, requires_grad=False).cuda(non_blocking=True)
+        input = Variable(input, requires_grad=False).cuda()
+        #     target = Variable(target, requires_grad=False).cuda(async=True)
+        target = Variable(target, requires_grad=False).cuda(non_blocking=True)
 
+        if architect is not None:
+            # get a random minibatch from the search queue with replacement
+            input_search, target_search = next(iter(valid_queue))
+            input_search = Variable(input_search, requires_grad=False).cuda()
+            #       target_search = Variable(target_search, requires_grad=False).cuda(async=True)
+            target_search = Variable(target_search, requires_grad=False).cuda(non_blocking=True)
 
-    if architect is not None:
-      # get a random minibatch from the search queue with replacement
-      input_search, target_search = next(iter(valid_queue))
-      input_search = Variable(input_search, requires_grad=False).cuda()
-#       target_search = Variable(target_search, requires_grad=False).cuda(async=True)
-      target_search = Variable(target_search, requires_grad=False).cuda(non_blocking=True)
+            architect.step(input, target, input_search, target_search, lr, optimizer,
+                           unrolled=args.unrolled)
 
+        optimizer.zero_grad()
+        logits = model(input)
+        loss = criterion(logits, target)
 
-      architect.step(input, target, input_search, target_search, lr, optimizer,
-                     unrolled=args.unrolled)
+        loss.backward()
+        nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
+        optimizer.step()
 
-    optimizer.zero_grad()
-    logits = model(input)
-    loss = criterion(logits, target)
+        prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+        objs.update(loss.data[0], n)
+        top1.update(prec1.data[0], n)
+        top5.update(prec5.data[0], n)
 
-    loss.backward()
-    nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
-    optimizer.step()
+        if step % args.report_freq == 0:
+            logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+            if args.debug:
+                break
 
-    prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-    objs.update(loss.data[0], n)
-    top1.update(prec1.data[0], n)
-    top5.update(prec5.data[0], n)
+    if args.compute_hessian:
+        if (epoch % args.report_freq_hessian == 0) or (epoch == (args.epochs - 1)):
+            _data_loader = deepcopy(train_queue)
+            input, target = next(iter(_data_loader))
 
-    if step % args.report_freq == 0:
-      logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
-      if args.debug:
-        break
+            input = Variable(input, requires_grad=False).cuda()
+            #       target = Variable(target, requires_grad=False).cuda(async=True)
+            target = Variable(target, requires_grad=False).cuda(non_blocking=True)
 
-  if args.compute_hessian:
-    if (epoch % args.report_freq_hessian == 0) or (epoch == (args.epochs - 1)):
-      _data_loader = deepcopy(train_queue)
-      input, target = next(iter(_data_loader))
+            # get gradient information
+            # param_grads = [p.grad for p in model.parameters() if p.grad is not None]
+            # param_grads = torch.cat([x.view(-1) for x in param_grads])
+            # param_grads = param_grads.cpu().data.numpy()
+            # grad_norm = np.linalg.norm(param_grads)
 
-      input = Variable(input, requires_grad=False).cuda()
-#       target = Variable(target, requires_grad=False).cuda(async=True)
-      target = Variable(target, requires_grad=False).cuda(non_blocking=True)
+            # gradient_vector = torch.cat([x.view(-1) for x in gradient_vector])
+            # grad_norm = LA.norm(gradient_vector.cpu())
+            # logging.info('\nCurrent grad norm based on Train Dataset: %.4f',
+            #             grad_norm)
 
+            if not args.debug:
+                H = analyser.compute_Hw(input, target, input_search, target_search,
+                                        lr, optimizer, False)
+                g = analyser.compute_dw(input, target, input_search, target_search,
+                                        lr, optimizer, False)
+                g = torch.cat([x.view(-1) for x in g])
 
-      # get gradient information
-      #param_grads = [p.grad for p in model.parameters() if p.grad is not None]
-      #param_grads = torch.cat([x.view(-1) for x in param_grads])
-      #param_grads = param_grads.cpu().data.numpy()
-      #grad_norm = np.linalg.norm(param_grads)
+                del _data_loader
 
-      #gradient_vector = torch.cat([x.view(-1) for x in gradient_vector]) 
-      #grad_norm = LA.norm(gradient_vector.cpu())
-      #logging.info('\nCurrent grad norm based on Train Dataset: %.4f',
-      #             grad_norm)
+                state = {'epoch': epoch,
+                         'H': H.cpu().data.numpy().tolist(),
+                         'g': g.cpu().data.numpy().tolist(),
+                         # 'g_train': float(grad_norm),
+                         # 'eig_train': eigenvalue,
+                         }
 
-      if not args.debug:
-        H = analyser.compute_Hw(input, target, input_search, target_search,
-                                lr, optimizer, False)
-        g = analyser.compute_dw(input, target, input_search, target_search,
-                                lr, optimizer, False)
-        g = torch.cat([x.view(-1) for x in g])
+                with codecs.open(os.path.join(args.save,
+                                              'derivatives_{}.json'.format(1)),
+                                 'a', encoding='utf-8') as file:
+                    json.dump(state, file, separators=(',', ':'))
+                    file.write('\n')
 
-        del _data_loader
+                # early stopping
+                ev = max(LA.eigvals(H.cpu().data.numpy()))
+            else:
+                ev = 0.1
+                if epoch >= 8 and iteration == 1:
+                    ev = 2.0
+            logging.info('CURRENT EV: %f', ev)
+            local_avg_tracker.update(epoch, ev, model.genotype())
 
-        state = {'epoch': epoch,
-                 'H': H.cpu().data.numpy().tolist(),
-                 'g': g.cpu().data.numpy().tolist(),
-                 #'g_train': float(grad_norm),
-                 #'eig_train': eigenvalue,
-                }
+            if args.early_stop and epoch != (args.epochs - 1):
+                local_avg_tracker.early_stop(epoch, args.factor, args.es_start_epoch,
+                                             args.delta)
 
-        with codecs.open(os.path.join(args.save,
-                                      'derivatives_{}.json'.format(1)),
-                                      'a', encoding='utf-8') as file:
-          json.dump(state, file, separators=(',', ':'))
-          file.write('\n')
-
-        # early stopping
-        ev = max(LA.eigvals(H.cpu().data.numpy()))
-      else:
-        ev = 0.1
-        if epoch >= 8 and iteration==1:
-          ev = 2.0
-      logging.info('CURRENT EV: %f', ev)
-      local_avg_tracker.update(epoch, ev, model.genotype())
-
-      if args.early_stop and epoch != (args.epochs - 1):
-        local_avg_tracker.early_stop(epoch, args.factor, args.es_start_epoch,
-                                     args.delta)
-
-  return top1.avg, objs.avg
+    return top1.avg, objs.avg
 
 
 def infer(valid_queue, model, criterion):
-  objs = utils.AvgrageMeter()
-  top1 = utils.AvgrageMeter()
-  top5 = utils.AvgrageMeter()
-  model.eval()
+    objs = utils.AvgrageMeter()
+    top1 = utils.AvgrageMeter()
+    top5 = utils.AvgrageMeter()
+    model.eval()
 
-  for step, (input, target) in enumerate(valid_queue):
-    input = Variable(input, volatile=True).cuda()
-#     target = Variable(target, volatile=True).cuda(async=True)
-    target = Variable(target, volatile=True).cuda(non_blocking=True)
+    for step, (input, target) in enumerate(valid_queue):
+        input = Variable(input, volatile=True).cuda()
+        #     target = Variable(target, volatile=True).cuda(async=True)
+        target = Variable(target, volatile=True).cuda(non_blocking=True)
 
+        logits = model(input)
+        loss = criterion(logits, target)
 
-    logits = model(input)
-    loss = criterion(logits, target)
+        prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+        n = input.size(0)
+        objs.update(loss.data[0], n)
+        top1.update(prec1.data[0], n)
+        top5.update(prec5.data[0], n)
 
-    prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-    n = input.size(0)
-    objs.update(loss.data[0], n)
-    top1.update(prec1.data[0], n)
-    top5.update(prec5.data[0], n)
+        if step % args.report_freq == 0:
+            logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+            if args.debug:
+                break
 
-    if step % args.report_freq == 0:
-      logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
-      if args.debug:
-        break
-
-  return top1.avg, objs.avg
+    return top1.avg, objs.avg
 
 
 if __name__ == '__main__':
-  space = spaces_dict[args.space]
-  main(space)
-
+    space = spaces_dict[args.space]
+    main(space)
