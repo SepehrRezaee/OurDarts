@@ -24,7 +24,7 @@ class Parser(object):
         parser.add_argument('--data', type=str, default='/kaggle/input/novelmindscientistsdataset/MRI')
         parser.add_argument('--space',                   type=str,            default='s4',           help='space index')
         parser.add_argument('--dataset',                 type=str,            default='ADiagnosis',      help='dataset')
-        parser.add_argument('--gpu',                     type=int,            default=0,              help='gpu device id')
+        parser.add_argument('--gpu',                     type=int,            default=[0, 1],              help='gpu device id')
         parser.add_argument('--model_path',              type=str,            default='/kaggle/working', help='path to save the model')
         parser.add_argument('--seed',                    type=int,            default=2,              help='random seed')
         parser.add_argument('--resume',                  action='store_true', default=False,          help='resume search')
